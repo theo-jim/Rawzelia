@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +21,10 @@ pub fn validate_source_guard(path: &Path) -> Result<(), SourceGuardError> {
     };
 
     if metadata.file_type().is_symlink() {
+        return Err(SourceGuardError::Incomplete);
+    }
+    #[cfg(unix)]
+    if metadata.nlink() > 1 {
         return Err(SourceGuardError::Incomplete);
     }
     if companion_exists(&append_suffix(path, ".lock"))? {

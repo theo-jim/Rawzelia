@@ -134,3 +134,37 @@ fn symlink_to_active_catalog_is_rejected() {
         vec![OsString::from("catalog.lrcat")]
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn hardlink_to_active_catalog_is_rejected() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("source");
+    let selection = directory.path().join("selection");
+    fs::create_dir_all(&source).expect("source directory must be created");
+    fs::create_dir_all(&selection).expect("selection directory must be created");
+
+    let catalog = source.join("catalog.lrcat");
+    let active_marker = source.join("catalog.lrcat-wal");
+    let catalog_link = selection.join("catalog.lrcat");
+    fs::write(&catalog, b"active catalog fixture").expect("catalog fixture must be written");
+    fs::write(&active_marker, b"active transaction").expect("active marker must be written");
+    fs::hard_link(&catalog, &catalog_link).expect("catalog hardlink must be created");
+    let before_contents = fs::read(&catalog).expect("catalog fixture must be readable");
+    let before_entries = directory_entries(&source);
+
+    assert_eq!(
+        validate_source_guard(&catalog_link),
+        Err(SourceGuardError::Incomplete)
+    );
+
+    assert_eq!(
+        fs::read(&catalog).expect("catalog fixture must remain readable"),
+        before_contents
+    );
+    assert_eq!(directory_entries(&source), before_entries);
+    assert_eq!(
+        directory_entries(&selection),
+        vec![OsString::from("catalog.lrcat")]
+    );
+}
