@@ -1,28 +1,33 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rawzelia_domain::{Adjustment, CoreValue, EditDocument, ImportStatus, ImportedField};
+use serde::{Deserialize, Serialize};
 
 use crate::StorageError;
 
 const RAWZELIA_XMP_BANNER: &str =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- rawzelia:xmp-mirror:v1 -->\n";
-static XMP_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CANONICAL_XMP_ROOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<XmpOutputRoot>>>> =
     OnceLock::new();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct XmpRootAuthority {
+    root: FileIdentity,
+    files: BTreeMap<PathBuf, FileIdentity>,
 }
 
 struct OwnedXmp {
@@ -32,6 +37,7 @@ struct OwnedXmp {
 
 pub struct XmpOutputRoot {
     directory: File,
+    identity: FileIdentity,
     owned: Mutex<BTreeMap<PathBuf, OwnedXmp>>,
 }
 
@@ -56,15 +62,11 @@ impl XmpOutputRoot {
             }
         };
         let opened = directory.metadata().map_err(StorageError::from_io)?;
-        let private_mode = opened.mode() & 0o077 == 0;
-        if !opened.is_dir()
-            || !private_mode
-            // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
-            || opened.uid() != unsafe { libc::geteuid() }
-        {
+        if !is_private_directory(&opened) {
             let _ = remove_directory_entry(parent.as_raw_fd(), &temporary_name);
             return Err(unowned_xmp_root());
         }
+        let identity = identity_from_metadata(&opened);
         if let Err(error) = rename_entry(
             parent.as_raw_fd(),
             &temporary_name,
@@ -82,7 +84,74 @@ impl XmpOutputRoot {
 
         Ok(Self {
             directory,
+            identity,
             owned: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub(crate) fn open_with_authority(
+        path: &Path,
+        authority: XmpRootAuthority,
+    ) -> Result<Self, StorageError> {
+        let root_name = root_directory_name(path)?;
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent_path)
+            .map_err(StorageError::from_io)?;
+        let directory =
+            open_directory_at(parent.as_raw_fd(), &root_name).map_err(|_| unowned_xmp_root())?;
+        let opened = directory.metadata().map_err(StorageError::from_io)?;
+        if !is_private_directory(&opened) || identity_from_metadata(&opened) != authority.root {
+            return Err(unowned_xmp_root());
+        }
+
+        let mut owned = BTreeMap::new();
+        for (relative_path, expected_identity) in authority.files {
+            let name = managed_xmp_name(&relative_path)?;
+            let file = open_owned_file_at(directory.as_raw_fd(), &name)?;
+            let metadata = file.metadata().map_err(StorageError::from_io)?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || identity_from_metadata(&metadata) != expected_identity
+            {
+                return Err(xmp_authority_conflict());
+            }
+            owned.insert(
+                relative_path,
+                OwnedXmp {
+                    file,
+                    identity: expected_identity,
+                },
+            );
+        }
+
+        Ok(Self {
+            directory,
+            identity: authority.root,
+            owned: Mutex::new(owned),
+        })
+    }
+
+    pub(crate) fn persistent_authority(
+        &self,
+        path: &Path,
+    ) -> Result<XmpRootAuthority, StorageError> {
+        if root_identity_at_path(path)? != Some(self.identity) {
+            return Err(unowned_xmp_root());
+        }
+        let files = self
+            .owned_files()?
+            .iter()
+            .map(|(path, owned)| (path.clone(), owned.identity))
+            .collect();
+        Ok(XmpRootAuthority {
+            root: self.identity,
+            files,
         })
     }
 
@@ -229,10 +298,16 @@ fn unmanaged_xmp_target() -> StorageError {
     }
 }
 
-fn unowned_xmp_root() -> StorageError {
+pub(crate) fn unowned_xmp_root() -> StorageError {
     StorageError::Io {
         code: "unowned_xmp_root".to_owned(),
         message_key: "storage.xmp.unowned_root".to_owned(),
+    }
+}
+
+fn xmp_authority_conflict() -> StorageError {
+    StorageError::Conflict {
+        fields: vec!["xmp.output_authority".to_owned()],
     }
 }
 
@@ -293,12 +368,28 @@ fn open_directory_at(parent: RawFd, name: &CStr) -> Result<File, std::io::Error>
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
+fn open_owned_file_at(directory: RawFd, name: &CStr) -> Result<File, StorageError> {
+    // SAFETY: `directory` is an open directory descriptor and `name` is a live C string.
+    let descriptor =
+        unsafe { libc::openat(directory, name.as_ptr(), libc::O_RDWR | libc::O_NOFOLLOW) };
+    if descriptor < 0 {
+        return Err(xmp_authority_conflict());
+    }
+    // SAFETY: `openat` returned a new owned descriptor that is transferred once.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
 fn create_temporary_file(directory: RawFd, target: &CStr) -> Result<TemporaryFile, StorageError> {
     let target = target.to_string_lossy();
     loop {
-        let sequence = XMP_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!(".{target}.tmp-{}-{sequence}", std::process::id()))
-            .map_err(|_| unmanaged_xmp_target())?;
+        let mut random = [0_u8; 16];
+        // SAFETY: `random` is writable for exactly its initialized byte length.
+        unsafe { libc::arc4random_buf(random.as_mut_ptr().cast(), random.len()) };
+        let name = CString::new(format!(
+            ".{target}.tmp-{:032x}",
+            u128::from_ne_bytes(random)
+        ))
+        .map_err(|_| unmanaged_xmp_target())?;
         // SAFETY: `directory` is an open directory descriptor and `name` is a live C string.
         let descriptor = unsafe {
             libc::openat(
@@ -335,7 +426,14 @@ fn rewrite_owned_xmp(
     bytes: &[u8],
     report: XmpWriteReport,
 ) -> Result<XmpWriteReport, StorageError> {
-    if entry_identity(directory.as_raw_fd(), target)? != Some(owned.identity) {
+    if entry_identity(directory.as_raw_fd(), target)? != Some(owned.identity)
+        || owned
+            .file
+            .metadata()
+            .map_err(StorageError::from_io)?
+            .nlink()
+            != 1
+    {
         return Err(unmanaged_xmp_target());
     }
 
@@ -344,29 +442,48 @@ fn rewrite_owned_xmp(
         let _ = unlink_entry(directory.as_raw_fd(), &staged.name);
         return Err(StorageError::from_io(error));
     }
-    if let Err(error) = copy_staged_bytes(&mut staged.file, &mut owned.file) {
+    let staged_metadata = staged.file.metadata().map_err(StorageError::from_io)?;
+    let staged_identity = identity_from_metadata(&staged_metadata);
+    if let Err(error) = rename_entry(
+        directory.as_raw_fd(),
+        &staged.name,
+        target,
+        libc::RENAME_SWAP,
+    ) {
         let _ = unlink_entry(directory.as_raw_fd(), &staged.name);
         return Err(StorageError::from_io(error));
     }
+
+    if entry_identity(directory.as_raw_fd(), &staged.name)? != Some(owned.identity) {
+        let rollback = rename_entry(
+            directory.as_raw_fd(),
+            &staged.name,
+            target,
+            libc::RENAME_SWAP,
+        );
+        if rollback.is_ok() {
+            let _ = unlink_entry(directory.as_raw_fd(), &staged.name);
+            let _ = directory.sync_all();
+        }
+        return Err(StorageError::Conflict {
+            fields: vec!["xmp.output_entry".to_owned()],
+        });
+    }
+
+    if entry_identity(directory.as_raw_fd(), target)? != Some(staged_identity) {
+        let _ = unlink_entry(directory.as_raw_fd(), &staged.name);
+        let _ = directory.sync_all();
+        return Err(StorageError::Conflict {
+            fields: vec!["xmp.output_entry".to_owned()],
+        });
+    }
+
+    owned.file = staged.file;
+    owned.identity = staged_identity;
+    directory.sync_all().map_err(StorageError::from_io)?;
     unlink_entry(directory.as_raw_fd(), &staged.name).map_err(StorageError::from_io)?;
     directory.sync_all().map_err(StorageError::from_io)?;
-
-    if entry_identity(directory.as_raw_fd(), target)? == Some(owned.identity) {
-        Ok(report)
-    } else {
-        Err(StorageError::Conflict {
-            fields: vec!["xmp.output_entry".to_owned()],
-        })
-    }
-}
-
-fn copy_staged_bytes(staged: &mut File, owned: &mut File) -> Result<(), std::io::Error> {
-    staged.seek(SeekFrom::Start(0))?;
-    owned.set_len(0)?;
-    owned.seek(SeekFrom::Start(0))?;
-    std::io::copy(staged, owned)?;
-    owned.flush()?;
-    owned.sync_all()
+    Ok(report)
 }
 
 fn publish_new(directory: RawFd, temporary: &CStr, target: &CStr) -> Result<(), StorageError> {
@@ -440,16 +557,48 @@ fn entry_identity(directory: RawFd, name: &CStr) -> Result<Option<FileIdentity>,
     if result == 0 {
         // SAFETY: a successful `fstatat` initialized the complete `stat` value.
         let metadata = unsafe { metadata.assume_init() };
-        return Ok(Some(FileIdentity {
-            device: metadata.st_dev as u64,
-            inode: metadata.st_ino,
-        }));
+        return Ok(Some(identity_from_stat(&metadata)));
     }
     let error = std::io::Error::last_os_error();
     if error.kind() == std::io::ErrorKind::NotFound {
         Ok(None)
     } else {
         Err(StorageError::from_io(error))
+    }
+}
+
+fn root_identity_at_path(path: &Path) -> Result<Option<FileIdentity>, StorageError> {
+    let root_name = root_directory_name(path)?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent_path)
+        .map_err(StorageError::from_io)?;
+    entry_identity(parent.as_raw_fd(), &root_name)
+}
+
+fn is_private_directory(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_dir()
+        && metadata.mode() & 0o077 == 0
+        // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+        && metadata.uid() == unsafe { libc::geteuid() }
+}
+
+fn identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+fn identity_from_stat(metadata: &libc::stat) -> FileIdentity {
+    FileIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino,
     }
 }
 

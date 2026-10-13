@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -11,7 +11,8 @@ use rawzelia_domain::{
     LightroomSchemaId,
 };
 use rawzelia_storage::{
-    StorageError, XmpOutputRoot, read_sidecar, write_sidecar_atomic, write_xmp_mirror,
+    CatalogStore, SqliteCatalog, StorageError, XmpOutputRoot, read_sidecar, write_sidecar_atomic,
+    write_xmp_mirror,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -372,4 +373,293 @@ fn output_root_capability_is_bound_to_open_directory() {
         replacement_bytes
     );
     assert!(moved_root.join("asset.nef.rawzelia.xmp").is_file());
+}
+
+#[test]
+fn failed_atomic_rewrite_preserves_previous_mirror() {
+    let temp = TestDirectory::new("xmp-failed-atomic-rewrite");
+    let root_path = temp.path().join("owned-xmp-output");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    let relative = Path::new("asset.nef.rawzelia.xmp");
+    let target = root_path.join(relative);
+    root.write_mirror(relative, &document("0.1.0"))
+        .expect("initial mirror must write");
+    let original = fs::read(&target).expect("initial mirror must be readable");
+
+    let watched_root = root_path.clone();
+    let blocker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let temporary_exists = fs::read_dir(&watched_root)
+                .expect("owned root must remain readable")
+                .any(|entry| {
+                    entry
+                        .expect("owned root entry must be readable")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".asset.nef.rawzelia.xmp.tmp-")
+                });
+            if temporary_exists {
+                fs::set_permissions(&watched_root, fs::Permissions::from_mode(0o500))
+                    .expect("root must become read-only before publication");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer temp file was not observed"
+            );
+            thread::yield_now();
+        }
+    });
+
+    let mut updated = document("0.1.1");
+    updated.community.insert(
+        "community.title".to_owned(),
+        field(
+            "community.title",
+            CoreValue::Text("x".repeat(16 * 1024 * 1024)),
+        ),
+    );
+    let result = root.write_mirror(relative, &updated);
+    blocker.join().expect("publication blocker must complete");
+    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700))
+        .expect("root permissions must be restored");
+
+    assert!(result.is_err(), "publication must fail on a read-only root");
+    assert!(
+        fs::read(&target).expect("previous mirror must remain readable") == original,
+        "failed publication must preserve the previous mirror byte-for-byte"
+    );
+}
+
+#[test]
+fn atomic_rewrite_publishes_new_file_identity() {
+    let temp = TestDirectory::new("xmp-atomic-rewrite");
+    let root_path = temp.path().join("owned-xmp-output");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    let relative = Path::new("asset.nef.rawzelia.xmp");
+    let target = root_path.join(relative);
+    root.write_mirror(relative, &document("0.1.0"))
+        .expect("initial mirror must write");
+    let original_inode = fs::symlink_metadata(&target)
+        .expect("initial mirror metadata must be readable")
+        .ino();
+
+    let mut updated = document("0.1.1");
+    updated.adjustments = vec![Adjustment::Exposure { value: 1.25 }];
+    root.write_mirror(relative, &updated)
+        .expect("atomic rewrite must succeed");
+
+    let rewritten = fs::read_to_string(&target).expect("updated mirror must be readable");
+    let rewritten_inode = fs::symlink_metadata(&target)
+        .expect("updated mirror metadata must be readable")
+        .ino();
+    assert_ne!(
+        rewritten_inode, original_inode,
+        "atomic publication must replace the destination inode"
+    );
+    assert!(rewritten.contains("<crs:Exposure2012>1.25</crs:Exposure2012>"));
+    assert!(!rewritten.contains("<crs:Exposure2012>0.5</crs:Exposure2012>"));
+}
+
+#[test]
+fn catalog_authority_recovers_xmp_root_after_restart() {
+    let temp = TestDirectory::new("xmp-authority-recovery");
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let root_path = temp.path().join("owned-xmp-output");
+    let relative = Path::new("asset.nef.rawzelia.xmp");
+
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    catalog.migrate().expect("catalog must migrate");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    root.write_mirror(relative, &document("0.1.0"))
+        .expect("initial mirror must write");
+    catalog
+        .persist_xmp_output_root(&root_path, &root)
+        .expect("external authority must persist");
+    drop(root);
+    drop(catalog);
+
+    let reopened = SqliteCatalog::open(&catalog_path).expect("catalog must reopen");
+    reopened
+        .migrate()
+        .expect("catalog migration must be current");
+    let recovered = reopened
+        .open_xmp_output_root(&root_path)
+        .expect("trusted root must recover after restart");
+    let mut updated = document("0.1.1");
+    updated.adjustments = vec![Adjustment::Exposure { value: 1.25 }];
+    recovered
+        .write_mirror(relative, &updated)
+        .expect("recovered root must write");
+
+    let rewritten =
+        fs::read_to_string(root_path.join(relative)).expect("recovered mirror must be readable");
+    assert!(rewritten.contains("<crs:Exposure2012>1.25</crs:Exposure2012>"));
+}
+
+#[test]
+fn root_local_authority_forgery_is_rejected() {
+    let temp = TestDirectory::new("xmp-root-local-forgery");
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let root_path = temp.path().join("forged-xmp-output");
+    fs::create_dir(&root_path).expect("forged root must be created");
+    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700))
+        .expect("forged root must look private");
+    let forged_proof = root_path.join(".rawzelia-authority");
+    let forged_bytes = b"rawzelia:xmp-root-authority:v1";
+    fs::write(&forged_proof, forged_bytes).expect("forged proof must be written");
+
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    catalog.migrate().expect("catalog must migrate");
+    let result = catalog.open_xmp_output_root(&root_path);
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Io { code, message_key })
+            if code == "unowned_xmp_root" && message_key == "storage.xmp.unowned_root"
+    ));
+    assert_eq!(
+        fs::read(forged_proof).expect("forged proof must remain readable"),
+        forged_bytes
+    );
+}
+
+#[test]
+fn authority_catalog_inside_xmp_root_is_rejected() {
+    let temp = TestDirectory::new("xmp-authority-inside-root");
+    let root_path = temp.path().join("owned-xmp-output");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    let catalog_path = root_path.join("catalog.sqlite");
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    catalog.migrate().expect("catalog must migrate");
+
+    let result = catalog.persist_xmp_output_root(&root_path, &root);
+
+    assert_eq!(
+        result,
+        Err(StorageError::Conflict {
+            fields: vec!["xmp.authority_store".to_owned()],
+        })
+    );
+}
+
+#[test]
+fn recovered_authority_rejects_substituted_file() {
+    let temp = TestDirectory::new("xmp-recovered-file-substitution");
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let root_path = temp.path().join("owned-xmp-output");
+    let relative = Path::new("asset.nef.rawzelia.xmp");
+    let target = root_path.join(relative);
+
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    catalog.migrate().expect("catalog must migrate");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    root.write_mirror(relative, &document("0.1.0"))
+        .expect("initial mirror must write");
+    catalog
+        .persist_xmp_output_root(&root_path, &root)
+        .expect("external authority must persist");
+    drop(root);
+    drop(catalog);
+
+    let concurrent_source = temp.path().join("lightroom-source.xmp");
+    let source_bytes = b"substituted-lightroom-source";
+    fs::write(&concurrent_source, source_bytes).expect("source must be written");
+    fs::rename(&concurrent_source, &target).expect("source must replace mirror");
+
+    let reopened = SqliteCatalog::open(&catalog_path).expect("catalog must reopen");
+    reopened
+        .migrate()
+        .expect("catalog migration must be current");
+    let result = reopened.open_xmp_output_root(&root_path);
+
+    assert!(matches!(result, Err(StorageError::Conflict { .. })));
+    assert_eq!(
+        fs::read(target).expect("substituted source must remain readable"),
+        source_bytes
+    );
+}
+
+#[test]
+fn recovered_authority_rejects_substituted_root() {
+    let temp = TestDirectory::new("xmp-recovered-root-substitution");
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let root_path = temp.path().join("owned-xmp-output");
+    let moved_root = temp.path().join("moved-owned-xmp-output");
+
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    catalog.migrate().expect("catalog must migrate");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    catalog
+        .persist_xmp_output_root(&root_path, &root)
+        .expect("external authority must persist");
+    drop(root);
+    drop(catalog);
+
+    fs::rename(&root_path, &moved_root).expect("owned root must move");
+    fs::create_dir(&root_path).expect("replacement root must be created");
+    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700))
+        .expect("replacement root must look private");
+    let replacement = root_path.join("asset.nef.rawzelia.xmp");
+    let replacement_bytes = b"replacement-root-source";
+    fs::write(&replacement, replacement_bytes).expect("replacement source must be written");
+
+    let reopened = SqliteCatalog::open(&catalog_path).expect("catalog must reopen");
+    reopened
+        .migrate()
+        .expect("catalog migration must be current");
+    let result = reopened.open_xmp_output_root(&root_path);
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Io { code, message_key })
+            if code == "unowned_xmp_root" && message_key == "storage.xmp.unowned_root"
+    ));
+    assert_eq!(
+        fs::read(replacement).expect("replacement source must remain readable"),
+        replacement_bytes
+    );
+}
+
+#[test]
+fn atomic_rewrite_authority_survives_catalog_reopen() {
+    let temp = TestDirectory::new("xmp-atomic-durability");
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let root_path = temp.path().join("owned-xmp-output");
+    let relative = Path::new("asset.nef.rawzelia.xmp");
+
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    catalog.migrate().expect("catalog must migrate");
+    let root = XmpOutputRoot::create(&root_path).expect("owned root must be created");
+    root.write_mirror(relative, &document("0.1.0"))
+        .expect("initial mirror must write");
+    catalog
+        .persist_xmp_output_root(&root_path, &root)
+        .expect("initial authority must persist");
+
+    let mut updated = document("0.1.1");
+    updated.adjustments = vec![Adjustment::Exposure { value: 1.25 }];
+    root.write_mirror(relative, &updated)
+        .expect("atomic rewrite must succeed");
+    catalog
+        .persist_xmp_output_root(&root_path, &root)
+        .expect("updated authority must persist");
+    drop(root);
+    drop(catalog);
+
+    let reopened = SqliteCatalog::open(&catalog_path).expect("catalog must reopen");
+    reopened
+        .migrate()
+        .expect("catalog migration must be current");
+    let recovered = reopened
+        .open_xmp_output_root(&root_path)
+        .expect("updated authority must recover");
+    recovered
+        .write_mirror(relative, &document("0.1.2"))
+        .expect("durable authority must permit another atomic rewrite");
+
+    let rewritten =
+        fs::read_to_string(root_path.join(relative)).expect("durable mirror must be readable");
+    assert!(rewritten.contains("<crs:Exposure2012>0.5</crs:Exposure2012>"));
 }

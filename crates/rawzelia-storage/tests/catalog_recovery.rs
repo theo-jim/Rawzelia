@@ -97,8 +97,8 @@ fn wal_restore_survives_interrupted_write() {
     let catalog_path = temp.path().join("catalog.sqlite");
     let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
 
-    assert_eq!(catalog.migrate().expect("migration must run"), 1);
-    assert_eq!(catalog.migrate().expect("migration must be idempotent"), 1);
+    assert_eq!(catalog.migrate().expect("migration must run"), 2);
+    assert_eq!(catalog.migrate().expect("migration must be idempotent"), 2);
 
     let asset_id = parse_asset_id("00000000-0000-0000-0000-000000000001");
     catalog
@@ -180,7 +180,7 @@ fn wal_restore_survives_interrupted_write() {
         restored_catalog
             .migrate()
             .expect("schema must remain current"),
-        1
+        2
     );
     assert_eq!(
         restored_catalog
@@ -200,4 +200,45 @@ fn wal_restore_survives_interrupted_write() {
             .expect("failed transaction must preserve current revision"),
         Some(document("0.1.0"))
     );
+}
+
+#[test]
+fn xmp_authority_migration_upgrades_v1_catalog() {
+    let temp = TestDirectory::new("xmp-authority-migration");
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let legacy = Connection::open(&catalog_path).expect("legacy catalog must open");
+    legacy
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO schema_migrations(version) VALUES (1);
+             PRAGMA user_version = 1;",
+        )
+        .expect("legacy v1 schema marker must be created");
+    drop(legacy);
+
+    let catalog = SqliteCatalog::open(&catalog_path).expect("catalog must open");
+    assert_eq!(catalog.migrate().expect("v1 catalog must upgrade"), 2);
+    drop(catalog);
+
+    let verifier = Connection::open(&catalog_path).expect("upgraded catalog must reopen");
+    let table_count: u64 = verifier
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'xmp_output_authorities'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("authority table must be queryable");
+    let migration_count: u64 = verifier
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 2",
+            [],
+            |row| row.get(0),
+        )
+        .expect("v2 migration marker must be queryable");
+    assert_eq!(table_count, 1);
+    assert_eq!(migration_count, 1);
 }

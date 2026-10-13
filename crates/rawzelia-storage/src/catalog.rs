@@ -17,6 +17,7 @@ use crate::backup::{
     BackupError, BackupReport, RestoreError, RestoreReport, create_backup, restore_backup,
 };
 use crate::migrations;
+use crate::xmp::{XmpOutputRoot, XmpRootAuthority, unowned_xmp_root};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -173,6 +174,62 @@ impl SqliteCatalog {
             code: "connection_lock_poisoned".to_owned(),
             message_key: "storage.sql.connection_lock".to_owned(),
         })
+    }
+
+    pub fn persist_xmp_output_root(
+        &self,
+        path: &Path,
+        root: &XmpOutputRoot,
+    ) -> Result<(), StorageError> {
+        self.require_external_xmp_authority_store(path)?;
+        let authority = root.persistent_authority(path)?;
+        let serialized = to_json(&authority)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StorageError::from_sql)?;
+        transaction
+            .execute(
+                "INSERT INTO xmp_output_authorities (root_path, authority_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(root_path) DO UPDATE SET
+                    authority_json = excluded.authority_json,
+                    updated_at = CURRENT_TIMESTAMP",
+                params![path.to_string_lossy(), serialized],
+            )
+            .map_err(StorageError::from_sql)?;
+        transaction.commit().map_err(StorageError::from_sql)
+    }
+
+    pub fn open_xmp_output_root(&self, path: &Path) -> Result<XmpOutputRoot, StorageError> {
+        self.require_external_xmp_authority_store(path)?;
+        let serialized = {
+            let connection = self.connection()?;
+            connection
+                .query_row(
+                    "SELECT authority_json FROM xmp_output_authorities WHERE root_path = ?1",
+                    [path.to_string_lossy()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(StorageError::from_sql)?
+        };
+        let authority: XmpRootAuthority = serialized
+            .as_deref()
+            .ok_or_else(unowned_xmp_root)
+            .and_then(from_json)?;
+        XmpOutputRoot::open_with_authority(path, authority)
+    }
+
+    fn require_external_xmp_authority_store(&self, root: &Path) -> Result<(), StorageError> {
+        let catalog_path = fs::canonicalize(&self.path).map_err(StorageError::from_io)?;
+        let root_path = fs::canonicalize(root).map_err(StorageError::from_io)?;
+        if catalog_path.starts_with(root_path) {
+            return Err(StorageError::Conflict {
+                fields: vec!["xmp.authority_store".to_owned()],
+            });
+        }
+        Ok(())
     }
 }
 
