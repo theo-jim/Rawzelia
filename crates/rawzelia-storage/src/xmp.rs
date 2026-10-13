@@ -1,14 +1,146 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
+use std::ffi::{CStr, CString};
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rawzelia_domain::{Adjustment, CoreValue, EditDocument, ImportStatus, ImportedField};
 
 use crate::StorageError;
-use crate::sidecar::write_bytes_atomic;
 
-const RAWZELIA_XMP_PREFIX: &str =
+const RAWZELIA_XMP_BANNER: &str =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- rawzelia:xmp-mirror:v1 -->\n";
+static XMP_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CANONICAL_XMP_ROOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<XmpOutputRoot>>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct OwnedXmp {
+    file: File,
+    identity: FileIdentity,
+}
+
+pub struct XmpOutputRoot {
+    directory: File,
+    owned: Mutex<BTreeMap<PathBuf, OwnedXmp>>,
+}
+
+impl XmpOutputRoot {
+    pub fn create(path: &Path) -> Result<Self, StorageError> {
+        let root_name = root_directory_name(path)?;
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent_path)
+            .map_err(StorageError::from_io)?;
+        let temporary_name = create_temporary_directory(parent.as_raw_fd())?;
+        let directory = match open_directory_at(parent.as_raw_fd(), &temporary_name) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = remove_directory_entry(parent.as_raw_fd(), &temporary_name);
+                return Err(StorageError::from_io(error));
+            }
+        };
+        let opened = directory.metadata().map_err(StorageError::from_io)?;
+        let private_mode = opened.mode() & 0o077 == 0;
+        if !opened.is_dir()
+            || !private_mode
+            // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+            || opened.uid() != unsafe { libc::geteuid() }
+        {
+            let _ = remove_directory_entry(parent.as_raw_fd(), &temporary_name);
+            return Err(unowned_xmp_root());
+        }
+        if let Err(error) = rename_entry(
+            parent.as_raw_fd(),
+            &temporary_name,
+            &root_name,
+            libc::RENAME_EXCL,
+        ) {
+            let _ = remove_directory_entry(parent.as_raw_fd(), &temporary_name);
+            return if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(unowned_xmp_root())
+            } else {
+                Err(StorageError::from_io(error))
+            };
+        }
+        parent.sync_all().map_err(StorageError::from_io)?;
+
+        Ok(Self {
+            directory,
+            owned: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub fn write_mirror(
+        &self,
+        relative_path: &Path,
+        document: &EditDocument,
+    ) -> Result<XmpWriteReport, StorageError> {
+        let target = managed_xmp_name(relative_path)?;
+        let (bytes, report) = render_xmp(document)?;
+        let mut owned = self.owned_files()?;
+        if let Some(existing) = owned.get_mut(relative_path) {
+            return rewrite_owned_xmp(&self.directory, &target, existing, &bytes, report);
+        }
+
+        let mut temporary = create_temporary_file(self.directory.as_raw_fd(), &target)?;
+        if let Err(error) = write_and_sync(&mut temporary.file, &bytes) {
+            let _ = unlink_entry(self.directory.as_raw_fd(), &temporary.name);
+            return Err(StorageError::from_io(error));
+        }
+        let new_identity = match entry_identity(self.directory.as_raw_fd(), &temporary.name) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                let _ = unlink_entry(self.directory.as_raw_fd(), &temporary.name);
+                return Err(StorageError::from_io(std::io::Error::from_raw_os_error(
+                    libc::ENOENT,
+                )));
+            }
+            Err(error) => {
+                let _ = unlink_entry(self.directory.as_raw_fd(), &temporary.name);
+                return Err(error);
+            }
+        };
+
+        publish_new(self.directory.as_raw_fd(), &temporary.name, &target)?;
+        owned.insert(
+            relative_path.to_path_buf(),
+            OwnedXmp {
+                file: temporary.file,
+                identity: new_identity,
+            },
+        );
+        self.directory.sync_all().map_err(StorageError::from_io)?;
+        Ok(report)
+    }
+
+    fn owned_files(&self) -> Result<MutexGuard<'_, BTreeMap<PathBuf, OwnedXmp>>, StorageError> {
+        self.owned.lock().map_err(|_| StorageError::Io {
+            code: "xmp_output_lock_poisoned".to_owned(),
+            message_key: "storage.xmp.output_lock".to_owned(),
+        })
+    }
+}
+
+struct TemporaryFile {
+    name: CString,
+    file: File,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmpSnapshot {
@@ -33,22 +165,35 @@ pub fn write_xmp_mirror(
     path: &Path,
     document: &EditDocument,
 ) -> Result<XmpWriteReport, StorageError> {
-    let managed_target = path
+    let file_name = path
         .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.ends_with(".rawzelia.xmp"));
-    if !managed_target {
-        return Err(unmanaged_xmp_target());
-    }
-    match fs::read(path) {
-        Ok(bytes) if bytes.starts_with(RAWZELIA_XMP_PREFIX.as_bytes()) => {}
-        Ok(_) => return Err(unmanaged_xmp_target()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(StorageError::from_io(error)),
-    }
+        .ok_or_else(unmanaged_xmp_target)
+        .map(Path::new)?;
+    managed_xmp_name(file_name)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root = {
+        let roots = CANONICAL_XMP_ROOTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut roots = roots.lock().map_err(|_| StorageError::Io {
+            code: "xmp_root_registry_poisoned".to_owned(),
+            message_key: "storage.xmp.root_registry".to_owned(),
+        })?;
+        if let Some(root) = roots.get(parent) {
+            Arc::clone(root)
+        } else {
+            let root = Arc::new(XmpOutputRoot::create(parent)?);
+            roots.insert(parent.to_path_buf(), Arc::clone(&root));
+            root
+        }
+    };
+    root.write_mirror(file_name, document)
+}
 
+fn render_xmp(document: &EditDocument) -> Result<(Vec<u8>, XmpWriteReport), StorageError> {
     let (properties, skipped_fields) = mirror_properties(document);
-    let mut xml = String::from(RAWZELIA_XMP_PREFIX);
+    let mut xml = String::from(RAWZELIA_XMP_BANNER);
     xml.push_str(
         "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
          <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
@@ -67,21 +212,244 @@ pub fn write_xmp_mirror(
         xml.push_str(">\n");
     }
     xml.push_str("</rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>\n");
-    write_bytes_atomic(path, xml.as_bytes())?;
-
-    Ok(XmpWriteReport {
+    let report = XmpWriteReport {
         mirrored_fields: u32::try_from(properties.len()).map_err(|_| StorageError::Io {
             code: "xmp_field_count_out_of_range".to_owned(),
             message_key: "storage.xmp.too_many_fields".to_owned(),
         })?,
         skipped_fields,
-    })
+    };
+    Ok((xml.into_bytes(), report))
 }
 
 fn unmanaged_xmp_target() -> StorageError {
     StorageError::Io {
         code: "unmanaged_xmp_target".to_owned(),
         message_key: "storage.xmp.unmanaged_target".to_owned(),
+    }
+}
+
+fn unowned_xmp_root() -> StorageError {
+    StorageError::Io {
+        code: "unowned_xmp_root".to_owned(),
+        message_key: "storage.xmp.unowned_root".to_owned(),
+    }
+}
+
+fn managed_xmp_name(path: &Path) -> Result<CString, StorageError> {
+    let file_name = path
+        .file_name()
+        .filter(|file_name| Path::new(file_name) == path)
+        .and_then(|file_name| file_name.to_str())
+        .filter(|file_name| file_name.ends_with(".rawzelia.xmp"))
+        .ok_or_else(unmanaged_xmp_target)?;
+    CString::new(file_name).map_err(|_| unmanaged_xmp_target())
+}
+
+fn root_directory_name(path: &Path) -> Result<CString, StorageError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(unowned_xmp_root)?;
+    CString::new(name).map_err(|_| unowned_xmp_root())
+}
+
+fn create_temporary_directory(parent: RawFd) -> Result<CString, StorageError> {
+    loop {
+        let mut random = [0_u8; 16];
+        // SAFETY: `random` is writable for exactly its initialized byte length.
+        unsafe { libc::arc4random_buf(random.as_mut_ptr().cast(), random.len()) };
+        let name = CString::new(format!(
+            ".rawzelia-xmp-root-{:032x}",
+            u128::from_ne_bytes(random)
+        ))
+        .map_err(|_| unowned_xmp_root())?;
+        // SAFETY: `parent` is an open directory and `name` is a live C string.
+        let result = unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) };
+        if result == 0 {
+            return Ok(name);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(StorageError::from_io(error));
+        }
+    }
+}
+
+fn open_directory_at(parent: RawFd, name: &CStr) -> Result<File, std::io::Error> {
+    // SAFETY: `parent` is an open directory descriptor and `name` is a live C string.
+    let descriptor = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor that is transferred once.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn create_temporary_file(directory: RawFd, target: &CStr) -> Result<TemporaryFile, StorageError> {
+    let target = target.to_string_lossy();
+    loop {
+        let sequence = XMP_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!(".{target}.tmp-{}-{sequence}", std::process::id()))
+            .map_err(|_| unmanaged_xmp_target())?;
+        // SAFETY: `directory` is an open directory descriptor and `name` is a live C string.
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor >= 0 {
+            return Ok(TemporaryFile {
+                name,
+                // SAFETY: `openat` returned a new owned descriptor that is transferred once.
+                file: unsafe { File::from_raw_fd(descriptor) },
+            });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(StorageError::from_io(error));
+        }
+    }
+}
+
+fn write_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), std::io::Error> {
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn rewrite_owned_xmp(
+    directory: &File,
+    target: &CStr,
+    owned: &mut OwnedXmp,
+    bytes: &[u8],
+    report: XmpWriteReport,
+) -> Result<XmpWriteReport, StorageError> {
+    if entry_identity(directory.as_raw_fd(), target)? != Some(owned.identity) {
+        return Err(unmanaged_xmp_target());
+    }
+
+    let mut staged = create_temporary_file(directory.as_raw_fd(), target)?;
+    if let Err(error) = write_and_sync(&mut staged.file, bytes) {
+        let _ = unlink_entry(directory.as_raw_fd(), &staged.name);
+        return Err(StorageError::from_io(error));
+    }
+    if let Err(error) = copy_staged_bytes(&mut staged.file, &mut owned.file) {
+        let _ = unlink_entry(directory.as_raw_fd(), &staged.name);
+        return Err(StorageError::from_io(error));
+    }
+    unlink_entry(directory.as_raw_fd(), &staged.name).map_err(StorageError::from_io)?;
+    directory.sync_all().map_err(StorageError::from_io)?;
+
+    if entry_identity(directory.as_raw_fd(), target)? == Some(owned.identity) {
+        Ok(report)
+    } else {
+        Err(StorageError::Conflict {
+            fields: vec!["xmp.output_entry".to_owned()],
+        })
+    }
+}
+
+fn copy_staged_bytes(staged: &mut File, owned: &mut File) -> Result<(), std::io::Error> {
+    staged.seek(SeekFrom::Start(0))?;
+    owned.set_len(0)?;
+    owned.seek(SeekFrom::Start(0))?;
+    std::io::copy(staged, owned)?;
+    owned.flush()?;
+    owned.sync_all()
+}
+
+fn publish_new(directory: RawFd, temporary: &CStr, target: &CStr) -> Result<(), StorageError> {
+    match rename_entry(directory, temporary, target, libc::RENAME_EXCL) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = unlink_entry(directory, temporary);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(unmanaged_xmp_target())
+            } else {
+                Err(StorageError::from_io(error))
+            }
+        }
+    }
+}
+
+fn rename_entry(
+    directory: RawFd,
+    source: &CStr,
+    destination: &CStr,
+    flags: libc::c_uint,
+) -> Result<(), std::io::Error> {
+    // SAFETY: both names are live C strings and both directory descriptors are valid.
+    let result = unsafe {
+        libc::renameatx_np(
+            directory,
+            source.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn unlink_entry(directory: RawFd, name: &CStr) -> Result<(), std::io::Error> {
+    // SAFETY: `name` is a live C string relative to the valid directory descriptor.
+    let result = unsafe { libc::unlinkat(directory, name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn remove_directory_entry(directory: RawFd, name: &CStr) -> Result<(), std::io::Error> {
+    // SAFETY: `name` is a live C string relative to the valid directory descriptor.
+    let result = unsafe { libc::unlinkat(directory, name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn entry_identity(directory: RawFd, name: &CStr) -> Result<Option<FileIdentity>, StorageError> {
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `metadata` is writable and `name` is valid for the duration of the call.
+    let result = unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        // SAFETY: a successful `fstatat` initialized the complete `stat` value.
+        let metadata = unsafe { metadata.assume_init() };
+        return Ok(Some(FileIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+        }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(StorageError::from_io(error))
     }
 }
 

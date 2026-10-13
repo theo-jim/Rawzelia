@@ -9,6 +9,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+libc = "0.2"
 rawzelia-domain = { path = "../rawzelia-domain" }
 rusqlite = { version = "0.37", features = ["backup"] }
 serde.workspace = true
