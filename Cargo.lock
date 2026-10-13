@@ -189,6 +189,12 @@ version = "0.1.0"
 [[package]]
 name = "rawzelia-io"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "rawzelia-domain",
+ "sha2",
+ "uuid",
+]
 
 [[package]]
 name = "rawzelia-lightroom-import"
