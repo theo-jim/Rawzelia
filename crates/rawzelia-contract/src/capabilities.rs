@@ -11,6 +11,7 @@ pub enum Capability {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CapabilitySet {
+    #[serde(rename = "contractVersion")]
     pub contract_version: u16,
     pub capabilities: Vec<Capability>,
 }
