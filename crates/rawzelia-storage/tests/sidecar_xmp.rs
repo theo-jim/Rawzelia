@@ -158,3 +158,49 @@ fn lightroom_xmp_source_is_rejected_without_mutation() {
         })
     );
 }
+
+#[test]
+fn unmanaged_existing_rawzelia_xmp_is_rejected_without_mutation() {
+    let temp = TestDirectory::new("unmanaged-rawzelia-xmp");
+    let source_path = temp.path().join("asset.nef.rawzelia.xmp");
+    let source_bytes = b"<x:xmpmeta>third-party-source</x:xmpmeta>";
+    fs::write(&source_path, source_bytes).expect("third-party XMP must be written");
+
+    let result = write_xmp_mirror(&source_path, &document("0.1.0"));
+
+    assert_eq!(
+        fs::read(&source_path).expect("third-party XMP must remain readable"),
+        source_bytes,
+        "an unmarked XMP must remain byte-for-byte unchanged"
+    );
+    assert_eq!(
+        result,
+        Err(StorageError::Io {
+            code: "unmanaged_xmp_target".to_owned(),
+            message_key: "storage.xmp.unmanaged_target".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn rawzelia_generated_xmp_can_be_written_again() {
+    let temp = TestDirectory::new("managed-rawzelia-xmp");
+    let path = temp.path().join("asset.nef.rawzelia.xmp");
+    write_xmp_mirror(&path, &document("0.1.0")).expect("initial mirror must write");
+
+    let initial = fs::read_to_string(&path).expect("initial mirror must be readable");
+    assert!(initial.starts_with(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- rawzelia:xmp-mirror:v1 -->\n"
+    ));
+
+    let mut updated = document("0.1.1");
+    updated.adjustments = vec![Adjustment::Exposure { value: 1.25 }];
+    write_xmp_mirror(&path, &updated).expect("owned mirror must allow a second write");
+
+    let rewritten = fs::read_to_string(&path).expect("updated mirror must be readable");
+    assert!(rewritten.starts_with(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- rawzelia:xmp-mirror:v1 -->\n"
+    ));
+    assert!(rewritten.contains("<crs:Exposure2012>1.25</crs:Exposure2012>"));
+    assert!(!rewritten.contains("<crs:Exposure2012>0.5</crs:Exposure2012>"));
+}

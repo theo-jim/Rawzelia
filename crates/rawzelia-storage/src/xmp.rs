@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::Path;
 
 use rawzelia_domain::{Adjustment, CoreValue, EditDocument, ImportStatus, ImportedField};
 
 use crate::StorageError;
 use crate::sidecar::write_bytes_atomic;
+
+const RAWZELIA_XMP_PREFIX: &str =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- rawzelia:xmp-mirror:v1 -->\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmpSnapshot {
@@ -34,16 +38,19 @@ pub fn write_xmp_mirror(
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.ends_with(".rawzelia.xmp"));
     if !managed_target {
-        return Err(StorageError::Io {
-            code: "unmanaged_xmp_target".to_owned(),
-            message_key: "storage.xmp.unmanaged_target".to_owned(),
-        });
+        return Err(unmanaged_xmp_target());
+    }
+    match fs::read(path) {
+        Ok(bytes) if bytes.starts_with(RAWZELIA_XMP_PREFIX.as_bytes()) => {}
+        Ok(_) => return Err(unmanaged_xmp_target()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StorageError::from_io(error)),
     }
 
     let (properties, skipped_fields) = mirror_properties(document);
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+    let mut xml = String::from(RAWZELIA_XMP_PREFIX);
+    xml.push_str(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
          <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
          <rdf:Description xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" \
          xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
@@ -69,6 +76,13 @@ pub fn write_xmp_mirror(
         })?,
         skipped_fields,
     })
+}
+
+fn unmanaged_xmp_target() -> StorageError {
+    StorageError::Io {
+        code: "unmanaged_xmp_target".to_owned(),
+        message_key: "storage.xmp.unmanaged_target".to_owned(),
+    }
 }
 
 pub fn reconcile_sources(
