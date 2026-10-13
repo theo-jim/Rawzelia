@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rawzelia_domain::{AssetId, CaptureDate, Fingerprint};
@@ -15,8 +15,6 @@ use uuid::Uuid;
 
 use crate::hash::fingerprint_open_file;
 use crate::{IoError, PathTemplate, destination_error, source_error};
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportRequest {
@@ -119,11 +117,156 @@ pub fn plan_ingest(request: &ImportRequest) -> Result<IngestPlan, IoError> {
             fingerprint,
         });
     }
+    require_effective_destination_uniqueness(&request.destination_root, &items)?;
 
     Ok(IngestPlan {
         items,
         destination_root: request.destination_root.clone(),
     })
+}
+
+fn require_effective_destination_uniqueness(
+    destination_root: &Path,
+    items: &[PlannedIngest],
+) -> Result<(), IoError> {
+    let mut groups = BTreeMap::<PathBuf, Vec<OsString>>::new();
+    for item in items {
+        let relative = item
+            .destination
+            .strip_prefix(destination_root)
+            .map_err(|_| IoError::DestinationUnavailable)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let name = relative
+            .file_name()
+            .ok_or(IoError::DestinationUnavailable)?;
+        groups
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push(name.to_os_string());
+    }
+    if !groups.values().any(|names| names.len() > 1) {
+        return Ok(());
+    }
+
+    let destination_volume = open_existing_destination_ancestor(destination_root)?;
+    for names in groups.values().filter(|names| names.len() > 1) {
+        if names_collide_on_volume(&destination_volume, names)? {
+            return Err(IoError::DestinationUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn names_collide_on_volume(directory: &OwnedFd, names: &[OsString]) -> Result<bool, IoError> {
+    let (probe_name, probe_directory, probe_identity) = create_probe_directory(directory)?;
+    let mut created = Vec::new();
+    let result = (|| {
+        for name in names {
+            let name = c_string(name).map_err(|_| IoError::DestinationUnavailable)?;
+            // SAFETY: descriptor and NUL-terminated name remain valid for the call.
+            let descriptor = unsafe {
+                libc::openat(
+                    probe_directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Ok(true);
+                }
+                return Err(destination_error(error));
+            }
+            // SAFETY: descriptor is checked above and transferred to one File.
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            let identity = descriptor_identity(file.as_raw_fd()).map_err(destination_error)?;
+            created.push((name, identity));
+        }
+        Ok(false)
+    })();
+
+    for (name, identity) in &created {
+        cleanup_temporary(&probe_directory, name, *identity);
+    }
+    drop(probe_directory);
+    cleanup_probe_directory(directory, &probe_name, probe_identity)?;
+    result
+}
+
+fn create_probe_directory(
+    directory: &OwnedFd,
+) -> Result<(CString, OwnedFd, FileIdentity), IoError> {
+    loop {
+        let name = CString::new(format!(".rawzelia-name-probe-{}", random_token()?))
+            .map_err(|_| IoError::DestinationUnavailable)?;
+        // SAFETY: descriptor and NUL-terminated random name remain valid for the call.
+        let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(destination_error(error));
+        }
+        // SAFETY: descriptor and created directory name remain valid for the call.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(destination_error(std::io::Error::last_os_error()));
+        }
+        // SAFETY: descriptor is checked above and transferred to one OwnedFd.
+        let owned = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let identity = descriptor_identity(owned.as_raw_fd()).map_err(destination_error)?;
+        return Ok((name, owned, identity));
+    }
+}
+
+fn cleanup_probe_directory(
+    directory: &OwnedFd,
+    name: &CString,
+    owned: FileIdentity,
+) -> Result<(), IoError> {
+    if path_identity(directory, name)? != Some(owned) {
+        return Err(IoError::DestinationUnavailable);
+    }
+    // SAFETY: identity was verified without following links; AT_REMOVEDIR never removes files.
+    let result =
+        unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(destination_error(std::io::Error::last_os_error()))
+    }
+}
+
+fn open_existing_destination_ancestor(path: &Path) -> Result<OwnedFd, IoError> {
+    let mut existing = resolved_destination_path(path)?;
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                return open_directory(&existing);
+            }
+            Ok(_) => return Err(IoError::DestinationUnavailable),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing
+                    .parent()
+                    .ok_or(IoError::DestinationUnavailable)?
+                    .to_path_buf();
+            }
+            Err(error) => return Err(destination_error(error)),
+        }
+    }
 }
 
 pub fn execute_ingest(
@@ -228,7 +371,7 @@ fn ingest_one(
         return Ok(outcome);
     }
 
-    let (temporary_name, mut temporary) = create_temporary(&parent_directory, file_name)?;
+    let (temporary_name, mut temporary, temporary_identity) = create_temporary(&parent_directory)?;
     let result = (|| {
         let mut source = open_source(&item.source)?;
         let copied = copy_and_hash(&mut source, &mut temporary, should_cancel)?;
@@ -237,7 +380,13 @@ fn ingest_one(
         }
         temporary.flush().map_err(destination_error)?;
         temporary.sync_all().map_err(destination_error)?;
+        if path_identity(&parent_directory, &temporary_name)? != Some(temporary_identity) {
+            return Err(IoError::DestinationUnavailable);
+        }
         drop(temporary);
+        if should_cancel() {
+            return Err(IoError::Cancelled);
+        }
 
         match rename_exclusive(&parent_directory, &temporary_name, file_name) {
             Ok(()) => {
@@ -259,7 +408,7 @@ fn ingest_one(
     })();
 
     if result.is_err() || matches!(result, Ok(ItemOutcome::Duplicate)) {
-        unlink_file(&parent_directory, &temporary_name);
+        cleanup_temporary(&parent_directory, &temporary_name, temporary_identity);
     }
     result
 }
@@ -432,15 +581,17 @@ fn duplicate_fd(fd: &OwnedFd) -> Result<OwnedFd, IoError> {
     }
 }
 
-fn create_temporary(directory: &OwnedFd, destination: &OsStr) -> Result<(CString, File), IoError> {
-    let destination = destination.to_string_lossy();
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    mode: libc::mode_t,
+}
+
+fn create_temporary(directory: &OwnedFd) -> Result<(CString, File, FileIdentity), IoError> {
     loop {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!(
-            ".{destination}.rawzelia-tmp-{}-{sequence}",
-            std::process::id()
-        ))
-        .map_err(|_| IoError::DestinationUnavailable)?;
+        let name = CString::new(format!(".rawzelia-tmp-{}", random_token()?))
+            .map_err(|_| IoError::DestinationUnavailable)?;
         // SAFETY: the valid directory descriptor and generated name live through the call.
         let descriptor = unsafe {
             libc::openat(
@@ -452,12 +603,77 @@ fn create_temporary(directory: &OwnedFd, destination: &OsStr) -> Result<(CString
         };
         if descriptor >= 0 {
             // SAFETY: descriptor is checked above and transferred to one File.
-            return Ok((name, unsafe { File::from_raw_fd(descriptor) }));
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            let identity = descriptor_identity(file.as_raw_fd()).map_err(destination_error)?;
+            return Ok((name, file, identity));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(destination_error(error));
         }
+    }
+}
+
+fn random_token() -> Result<Uuid, IoError> {
+    let mut bytes = [0_u8; 16];
+    // SAFETY: bytes points to a writable buffer of the exact supplied length.
+    let result = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) };
+    if result != 0 {
+        return Err(destination_error(std::io::Error::last_os_error()));
+    }
+    Ok(Uuid::from_bytes(bytes))
+}
+
+fn descriptor_identity(descriptor: libc::c_int) -> std::io::Result<FileIdentity> {
+    let mut status = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: status points to writable storage and descriptor is borrowed for the call.
+    let result = unsafe { libc::fstat(descriptor, status.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful fstat initialized the complete stat structure.
+    let status = unsafe { status.assume_init() };
+    Ok(FileIdentity {
+        device: status.st_dev,
+        inode: status.st_ino,
+        mode: status.st_mode,
+    })
+}
+
+fn path_identity(directory: &OwnedFd, name: &CString) -> Result<Option<FileIdentity>, IoError> {
+    let mut status = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: status is writable; descriptor and NUL-terminated name remain valid.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(destination_error(error));
+    }
+    // SAFETY: a successful fstatat initialized the complete stat structure.
+    let status = unsafe { status.assume_init() };
+    Ok(Some(FileIdentity {
+        device: status.st_dev,
+        inode: status.st_ino,
+        mode: status.st_mode,
+    }))
+}
+
+fn cleanup_temporary(directory: &OwnedFd, name: &CString, owned: FileIdentity) {
+    if !matches!(path_identity(directory, name), Ok(Some(current)) if current == owned) {
+        return;
+    }
+    // SAFETY: identity was verified without following links immediately before this call.
+    unsafe {
+        libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
     }
 }
 
@@ -514,13 +730,6 @@ fn rename_exclusive(
     }
 }
 
-fn unlink_file(directory: &OwnedFd, name: &CString) {
-    // SAFETY: name and the owned directory descriptor remain valid for the call.
-    unsafe {
-        libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
-    }
-}
-
 fn sync_directory(directory: &OwnedFd) -> Result<(), IoError> {
     // SAFETY: fsync only borrows the valid owned directory descriptor.
     let result = unsafe { libc::fsync(directory.as_raw_fd()) };
@@ -567,7 +776,7 @@ fn require_destination_outside_source(
     source_root: &Path,
 ) -> Result<(), IoError> {
     let destination = resolved_destination_path(destination)?;
-    if destination.starts_with(source_root) {
+    if destination.starts_with(source_root) || source_root.starts_with(&destination) {
         Err(IoError::DestinationUnavailable)
     } else {
         Ok(())

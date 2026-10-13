@@ -1,5 +1,5 @@
-use std::cell::Cell;
-use std::fs;
+use std::cell::{Cell, RefCell};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,6 +50,27 @@ fn request(
         template: PathTemplate::default(),
         session_name: "Session test".to_owned(),
     }
+}
+
+fn volume_names_collide(root: &Path, first: &str, second: &str) -> bool {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let probe = root.join(format!(
+        ".rawzelia-name-probe-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&probe).expect("probe directory should be created");
+    fs::write(probe.join(first), b"probe").expect("first probe name should be created");
+    let collision = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(probe.join(second))
+    {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+        Err(error) => panic!("second probe name failed unexpectedly: {error}"),
+    };
+    fs::remove_dir_all(&probe).expect("probe directory should be removed");
+    collision
 }
 
 #[test]
@@ -195,6 +216,176 @@ fn hash_mismatch_never_publishes_a_destination() {
 
     assert_eq!(result, Err(IoError::HashMismatch));
     assert!(!destination.exists());
+}
+
+#[test]
+fn post_copy_cancellation_does_not_publish() {
+    let fixture = TestDirectory::new("post-copy-cancel");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let source = source_root.join("DSC_0001.NEF");
+    let source_bytes = b"small payload copied in one read";
+    fs::write(&source, source_bytes).unwrap();
+    let plan = plan_ingest(&request(
+        &source_root,
+        vec![source.clone()],
+        &destination_root,
+    ))
+    .unwrap();
+    let calls = Cell::new(0_u8);
+    let cancellation_armed = Cell::new(false);
+
+    let result = execute_ingest(&plan, &mut |_| {}, &|| {
+        let call = calls.get();
+        calls.set(call + 1);
+        if call == 2 {
+            cancellation_armed.set(true);
+            false
+        } else {
+            cancellation_armed.get()
+        }
+    });
+
+    assert_eq!(result, Err(IoError::Cancelled));
+    assert!(cancellation_armed.get());
+    assert!(!plan.items[0].destination.exists());
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
+}
+
+#[test]
+fn substituted_temporary_is_not_removed_during_cleanup() {
+    let fixture = TestDirectory::new("temporary-substitution");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let source = source_root.join("DSC_0001.NEF");
+    let source_bytes = b"source remains byte-for-byte unchanged";
+    let third_party_bytes = b"third-party replacement must survive";
+    fs::write(&source, source_bytes).unwrap();
+    let plan = plan_ingest(&request(
+        &source_root,
+        vec![source.clone()],
+        &destination_root,
+    ))
+    .unwrap();
+    let calls = Cell::new(0_u8);
+    let replacement_path = RefCell::new(None);
+
+    let result = execute_ingest(&plan, &mut |_| {}, &|| {
+        let call = calls.get();
+        calls.set(call + 1);
+        if call != 1 {
+            return false;
+        }
+        let parent = plan.items[0].destination.parent().unwrap();
+        let temporary = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".rawzelia-tmp-"))
+            })
+            .expect("owned temporary should exist");
+        fs::remove_file(&temporary).unwrap();
+        fs::write(&temporary, third_party_bytes).unwrap();
+        replacement_path.replace(Some(temporary));
+        true
+    });
+
+    assert_eq!(result, Err(IoError::Cancelled));
+    let replacement = replacement_path.borrow();
+    let replacement = replacement
+        .as_ref()
+        .expect("replacement should be installed");
+    assert_eq!(fs::read(replacement).unwrap(), third_party_bytes);
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
+    assert!(!plan.items[0].destination.exists());
+}
+
+#[test]
+fn destination_case_collisions_are_rejected_during_planning() {
+    let fixture = TestDirectory::new("case-collision");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    let first_dir = source_root.join("first");
+    let second_dir = source_root.join("second");
+    fs::create_dir_all(&first_dir).unwrap();
+    fs::create_dir(&second_dir).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let first = first_dir.join("A.NEF");
+    let second = second_dir.join("a.nef");
+    fs::write(&first, b"first source").unwrap();
+    fs::write(&second, b"second source").unwrap();
+
+    let result = plan_ingest(&request(
+        &source_root,
+        vec![first.clone(), second.clone()],
+        &destination_root,
+    ));
+
+    if volume_names_collide(&destination_root, "A.NEF", "a.nef") {
+        assert!(matches!(result, Err(IoError::DestinationUnavailable)));
+    } else {
+        assert_eq!(result.unwrap().items.len(), 2);
+    }
+    assert_eq!(fs::read(first).unwrap(), b"first source");
+    assert_eq!(fs::read(second).unwrap(), b"second source");
+}
+
+#[test]
+fn destination_unicode_collisions_are_rejected_during_planning() {
+    let fixture = TestDirectory::new("unicode-collision");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    let first_dir = source_root.join("first");
+    let second_dir = source_root.join("second");
+    fs::create_dir_all(&first_dir).unwrap();
+    fs::create_dir(&second_dir).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let composed_name = "caf\u{00e9}.NEF";
+    let decomposed_name = "cafe\u{0301}.NEF";
+    let first = first_dir.join(composed_name);
+    let second = second_dir.join(decomposed_name);
+    fs::write(&first, b"first source").unwrap();
+    fs::write(&second, b"second source").unwrap();
+
+    let result = plan_ingest(&request(
+        &source_root,
+        vec![first.clone(), second.clone()],
+        &destination_root,
+    ));
+
+    if volume_names_collide(&destination_root, composed_name, decomposed_name) {
+        assert!(matches!(result, Err(IoError::DestinationUnavailable)));
+    } else {
+        assert_eq!(result.unwrap().items.len(), 2);
+    }
+    assert_eq!(fs::read(first).unwrap(), b"first source");
+    assert_eq!(fs::read(second).unwrap(), b"second source");
+}
+
+#[test]
+fn source_nested_in_destination_is_rejected() {
+    let fixture = TestDirectory::new("source-in-destination");
+    let destination_root = fixture.path().join("destination");
+    let source_root = destination_root.join("mounted-card");
+    fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("DSC_0001.NEF");
+    let source_bytes = b"source nested under destination";
+    fs::write(&source, source_bytes).unwrap();
+
+    let result = plan_ingest(&request(
+        &source_root,
+        vec![source.clone()],
+        &destination_root,
+    ));
+
+    assert!(matches!(result, Err(IoError::DestinationUnavailable)));
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
 }
 
 #[cfg(unix)]

@@ -18,7 +18,7 @@ pub fn classify_volume(path: &Path) -> Result<VolumeInfo, IoError> {
     let root = absolute_path(path)?;
     let availability = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => AssetAvailability::Moved,
-        Ok(metadata) if metadata.is_dir() => AssetAvailability::Present,
+        Ok(metadata) if metadata.is_dir() => directory_availability(path)?,
         Ok(_) => AssetAvailability::Missing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             AssetAvailability::VolumeOffline
@@ -34,6 +34,22 @@ pub fn classify_volume(path: &Path) -> Result<VolumeInfo, IoError> {
         location_id: location_id(path)?,
         availability,
     })
+}
+
+fn directory_availability(path: &Path) -> Result<AssetAvailability, IoError> {
+    match fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Ok(AssetAvailability::PermissionDenied)
+            }
+            Some(Err(error)) => Err(IoError::Io(error.to_string())),
+            Some(Ok(_)) | None => Ok(AssetAvailability::Present),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(AssetAvailability::PermissionDenied)
+        }
+        Err(error) => Err(IoError::Io(error.to_string())),
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, IoError> {

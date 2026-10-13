@@ -2,6 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use rawzelia_domain::AssetAvailability;
 use rawzelia_io::classify_volume;
 
@@ -33,6 +36,16 @@ impl TestDirectory {
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+struct PermissionGuard(PathBuf);
+
+#[cfg(unix)]
+impl Drop for PermissionGuard {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
     }
 }
 
@@ -75,4 +88,19 @@ fn symlinked_volume_is_not_marked_present() {
 
     assert_eq!(volume.availability, AssetAvailability::Moved);
     assert_ne!(volume.availability, AssetAvailability::Present);
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_volume_is_permission_denied() {
+    let fixture = TestDirectory::new("permission-denied-volume");
+    let root = fixture.path().join("root");
+    fs::create_dir(&root).expect("volume root should be created");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o000))
+        .expect("volume permissions should be removed");
+    let _guard = PermissionGuard(root.clone());
+
+    let volume = classify_volume(&root).expect("inaccessible volume should be classified");
+
+    assert_eq!(volume.availability, AssetAvailability::PermissionDenied);
 }
