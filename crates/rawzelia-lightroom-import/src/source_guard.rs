@@ -12,12 +12,15 @@ pub enum SourceGuardError {
 }
 
 pub fn validate_source_guard(path: &Path) -> Result<(), SourceGuardError> {
-    let metadata = match fs::metadata(path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Err(SourceGuardError::Missing),
         Err(error) => return Err(SourceGuardError::Io(error.to_string())),
     };
 
+    if metadata.file_type().is_symlink() {
+        return Err(SourceGuardError::Incomplete);
+    }
     if companion_exists(&append_suffix(path, ".lock"))? {
         return Err(SourceGuardError::Locked);
     }
