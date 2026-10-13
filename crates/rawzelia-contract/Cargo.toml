@@ -10,6 +10,5 @@ path = "src/lib.rs"
 
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+uuid = { version = "1.18", default-features = false, features = ["serde"] }
