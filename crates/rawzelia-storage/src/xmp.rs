@@ -29,10 +29,14 @@ pub fn write_xmp_mirror(
     path: &Path,
     document: &EditDocument,
 ) -> Result<XmpWriteReport, StorageError> {
-    if path.extension().and_then(|value| value.to_str()) != Some("xmp") {
+    let managed_target = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.ends_with(".rawzelia.xmp"));
+    if !managed_target {
         return Err(StorageError::Io {
-            code: "invalid_xmp_extension".to_owned(),
-            message_key: "storage.invalid_extension".to_owned(),
+            code: "unmanaged_xmp_target".to_owned(),
+            message_key: "storage.xmp.unmanaged_target".to_owned(),
         });
     }
 
@@ -72,6 +76,14 @@ pub fn reconcile_sources(
     sidecar: &EditDocument,
     xmp: &XmpSnapshot,
 ) -> Result<Reconciliation, StorageError> {
+    reconcile_sources_with_optional_xmp(catalog, sidecar, Some(xmp))
+}
+
+pub fn reconcile_sources_with_optional_xmp(
+    catalog: &EditDocument,
+    sidecar: &EditDocument,
+    xmp: Option<&XmpSnapshot>,
+) -> Result<Reconciliation, StorageError> {
     let document_conflicts = document_conflicts(catalog, sidecar);
     if !document_conflicts.is_empty() {
         return Ok(Reconciliation::Conflict {
@@ -79,14 +91,14 @@ pub fn reconcile_sources(
         });
     }
 
-    if xmp.fields.is_empty() {
+    let Some(xmp) = xmp else {
         return Ok(Reconciliation::CatalogAuthoritative);
-    }
+    };
 
     let (catalog_xmp, _) = mirror_properties(catalog);
     let mut conflicts = BTreeSet::new();
-    for (field, value) in &xmp.fields {
-        if catalog_xmp.get(field) != Some(value) {
+    for field in catalog_xmp.keys().chain(xmp.fields.keys()) {
+        if catalog_xmp.get(field) != xmp.fields.get(field) {
             conflicts.insert(format!("xmp.{field}"));
         }
     }

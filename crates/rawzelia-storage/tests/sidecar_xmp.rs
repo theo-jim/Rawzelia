@@ -7,7 +7,7 @@ use rawzelia_domain::{
     Adjustment, CoreValue, EditDocument, FieldProvenance, Fingerprint, ImportStatus, ImportedField,
     LightroomSchemaId,
 };
-use rawzelia_storage::{read_sidecar, write_sidecar_atomic, write_xmp_mirror};
+use rawzelia_storage::{StorageError, read_sidecar, write_sidecar_atomic, write_xmp_mirror};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -117,7 +117,7 @@ fn sidecar_write_is_atomic_and_round_trips() {
         Some(second.clone())
     );
 
-    let xmp_path = temp.path().join("asset.nef.xmp");
+    let xmp_path = temp.path().join("asset.nef.rawzelia.xmp");
     let report = write_xmp_mirror(&xmp_path, &second).expect("XMP mirror must write");
     assert_eq!(report.mirrored_fields, 3);
     assert_eq!(report.skipped_fields, 2);
@@ -134,4 +134,27 @@ fn sidecar_write_is_atomic_and_round_trips() {
         .map(|entry| entry.expect("entry must be readable").file_name())
         .collect();
     assert_eq!(entries.len(), 2, "atomic writes must leave no temp files");
+}
+
+#[test]
+fn lightroom_xmp_source_is_rejected_without_mutation() {
+    let temp = TestDirectory::new("xmp-source-read-only");
+    let source_path = temp.path().join("asset.nef.xmp");
+    let source_bytes = b"<x:xmpmeta>lightroom-source</x:xmpmeta>";
+    fs::write(&source_path, source_bytes).expect("source XMP must be written");
+
+    let result = write_xmp_mirror(&source_path, &document("0.1.0"));
+
+    assert_eq!(
+        fs::read(&source_path).expect("source XMP must remain readable"),
+        source_bytes,
+        "source XMP must remain byte-for-byte unchanged"
+    );
+    assert_eq!(
+        result,
+        Err(StorageError::Io {
+            code: "unmanaged_xmp_target".to_owned(),
+            message_key: "storage.xmp.unmanaged_target".to_owned(),
+        })
+    );
 }
