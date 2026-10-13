@@ -158,7 +158,7 @@ fn require_effective_destination_uniqueness(
 }
 
 fn names_collide_on_volume(directory: &OwnedFd, names: &[OsString]) -> Result<bool, IoError> {
-    let (probe_name, probe_directory, probe_identity) = create_probe_directory(directory)?;
+    let probe_directory = create_private_staging_directory(directory)?;
     let mut created = Vec::new();
     let result = (|| {
         for name in names {
@@ -184,26 +184,27 @@ fn names_collide_on_volume(directory: &OwnedFd, names: &[OsString]) -> Result<bo
                 return Err(destination_error(error));
             }
             // SAFETY: descriptor is checked above and transferred to one File.
-            let file = unsafe { File::from_raw_fd(descriptor) };
-            let identity = descriptor_identity(file.as_raw_fd()).map_err(destination_error)?;
-            created.push((name, identity));
+            drop(unsafe { File::from_raw_fd(descriptor) });
+            created.push(name);
         }
         Ok(false)
     })();
 
-    for (name, identity) in &created {
-        cleanup_temporary(&probe_directory, name, *identity);
+    for name in &created {
+        // SAFETY: the probe directory is an exclusively-created private directory held open
+        // for this operation, and every name was created above inside that directory.
+        unsafe {
+            libc::unlinkat(probe_directory.as_raw_fd(), name.as_ptr(), 0);
+        }
     }
-    drop(probe_directory);
-    cleanup_probe_directory(directory, &probe_name, probe_identity)?;
+    // Removing the staging directory through its public parent would reintroduce a
+    // check-to-unlink race, so the empty private directory is conservatively quarantined.
     result
 }
 
-fn create_probe_directory(
-    directory: &OwnedFd,
-) -> Result<(CString, OwnedFd, FileIdentity), IoError> {
+fn create_private_staging_directory(directory: &OwnedFd) -> Result<OwnedFd, IoError> {
     loop {
-        let name = CString::new(format!(".rawzelia-name-probe-{}", random_token()?))
+        let name = CString::new(format!(".rawzelia-stage-{}", random_token()?))
             .map_err(|_| IoError::DestinationUnavailable)?;
         // SAFETY: descriptor and NUL-terminated random name remain valid for the call.
         let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -227,26 +228,18 @@ fn create_probe_directory(
         }
         // SAFETY: descriptor is checked above and transferred to one OwnedFd.
         let owned = unsafe { OwnedFd::from_raw_fd(descriptor) };
-        let identity = descriptor_identity(owned.as_raw_fd()).map_err(destination_error)?;
-        return Ok((name, owned, identity));
-    }
-}
-
-fn cleanup_probe_directory(
-    directory: &OwnedFd,
-    name: &CString,
-    owned: FileIdentity,
-) -> Result<(), IoError> {
-    if path_identity(directory, name)? != Some(owned) {
-        return Err(IoError::DestinationUnavailable);
-    }
-    // SAFETY: identity was verified without following links; AT_REMOVEDIR never removes files.
-    let result =
-        unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(destination_error(std::io::Error::last_os_error()))
+        // SAFETY: the descriptor refers to the directory created above.
+        if unsafe { libc::fchmod(owned.as_raw_fd(), 0o700) } != 0 {
+            return Err(destination_error(std::io::Error::last_os_error()));
+        }
+        let status = descriptor_status(owned.as_raw_fd()).map_err(destination_error)?;
+        if status.identity.mode & libc::S_IFMT != libc::S_IFDIR
+            || status.identity.mode & 0o777 != 0o700
+            || status.owner != unsafe { libc::geteuid() }
+        {
+            return Err(IoError::DestinationUnavailable);
+        }
+        return Ok(owned);
     }
 }
 
@@ -284,6 +277,9 @@ pub fn execute_ingest(
     });
 
     let destination_root = open_destination_root(&plan.destination_root)?;
+    // The descriptor, not the public path entry, remains the authority for this execution.
+    // Failed temporaries are quarantined rather than removed through a substitutable name.
+    let staging_directory = create_private_staging_directory(&destination_root)?;
     let mut summary = ImportSummary {
         imported: 0,
         duplicates: 0,
@@ -305,6 +301,7 @@ pub fn execute_ingest(
 
         match ingest_one(
             &destination_root,
+            &staging_directory,
             &plan.destination_root,
             item,
             should_cancel,
@@ -353,6 +350,7 @@ enum ItemOutcome {
 
 fn ingest_one(
     destination_root: &OwnedFd,
+    staging_directory: &OwnedFd,
     destination_root_path: &Path,
     item: &PlannedIngest,
     should_cancel: &dyn Fn() -> bool,
@@ -371,46 +369,86 @@ fn ingest_one(
         return Ok(outcome);
     }
 
-    let (temporary_name, mut temporary, temporary_identity) = create_temporary(&parent_directory)?;
-    let result = (|| {
-        let mut source = open_source(&item.source)?;
-        let copied = copy_and_hash(&mut source, &mut temporary, should_cancel)?;
-        if copied != item.fingerprint {
-            return Err(IoError::HashMismatch);
-        }
-        temporary.flush().map_err(destination_error)?;
-        temporary.sync_all().map_err(destination_error)?;
-        if path_identity(&parent_directory, &temporary_name)? != Some(temporary_identity) {
-            return Err(IoError::DestinationUnavailable);
-        }
-        drop(temporary);
-        if should_cancel() {
-            return Err(IoError::Cancelled);
-        }
-
-        match rename_exclusive(&parent_directory, &temporary_name, file_name) {
-            Ok(()) => {
-                sync_directory(&parent_directory)?;
-                Ok(ItemOutcome::Imported)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if matches!(
-                    existing_destination(&parent_directory, file_name, item.fingerprint)?,
-                    Some(ItemOutcome::Duplicate)
-                ) {
-                    Ok(ItemOutcome::Duplicate)
-                } else {
-                    Err(IoError::DestinationUnavailable)
-                }
-            }
-            Err(error) => Err(destination_error(error)),
-        }
-    })();
-
-    if result.is_err() || matches!(result, Ok(ItemOutcome::Duplicate)) {
-        cleanup_temporary(&parent_directory, &temporary_name, temporary_identity);
+    let (temporary_name, mut temporary, temporary_identity) = create_temporary(staging_directory)?;
+    let mut source = open_source(&item.source)?;
+    let copied = copy_and_hash(&mut source, &mut temporary, should_cancel)?;
+    if copied != item.fingerprint {
+        return Err(IoError::HashMismatch);
     }
-    result
+    temporary.flush().map_err(destination_error)?;
+    temporary.sync_all().map_err(destination_error)?;
+    drop(temporary);
+    if should_cancel() {
+        return Err(IoError::Cancelled);
+    }
+    validate_staged_file(
+        staging_directory,
+        &temporary_name,
+        temporary_identity,
+        item.fingerprint,
+    )?;
+
+    match rename_exclusive(
+        staging_directory,
+        &temporary_name,
+        &parent_directory,
+        file_name,
+    ) {
+        Ok(()) => {
+            sync_directory(staging_directory)?;
+            sync_directory(&parent_directory)?;
+            Ok(ItemOutcome::Imported)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if matches!(
+                existing_destination(&parent_directory, file_name, item.fingerprint)?,
+                Some(ItemOutcome::Duplicate)
+            ) {
+                Ok(ItemOutcome::Duplicate)
+            } else {
+                Err(IoError::DestinationUnavailable)
+            }
+        }
+        Err(error) => Err(destination_error(error)),
+    }
+}
+
+fn validate_staged_file(
+    staging_directory: &OwnedFd,
+    name: &CString,
+    owned: FileIdentity,
+    expected: Fingerprint,
+) -> Result<(), IoError> {
+    // SAFETY: the private staging descriptor and NUL-terminated unpredictable name are valid.
+    let descriptor = unsafe {
+        libc::openat(
+            staging_directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(IoError::DestinationUnavailable);
+    }
+    // SAFETY: descriptor is checked above and transferred exactly once.
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    let before = descriptor_status(file.as_raw_fd()).map_err(destination_error)?;
+    if before.identity != owned
+        || before.links != 1
+        || before.identity.mode & libc::S_IFMT != libc::S_IFREG
+    {
+        return Err(IoError::DestinationUnavailable);
+    }
+    let actual = fingerprint_open_file(&mut file).map_err(|_| IoError::DestinationUnavailable)?;
+    let after = descriptor_status(file.as_raw_fd()).map_err(destination_error)?;
+    if after.identity != owned
+        || after.links != 1
+        || after.size != expected.size
+        || actual != expected
+    {
+        return Err(IoError::DestinationUnavailable);
+    }
+    Ok(())
 }
 
 fn open_source(path: &Path) -> Result<File, IoError> {
@@ -588,6 +626,13 @@ struct FileIdentity {
     mode: libc::mode_t,
 }
 
+struct FileStatus {
+    identity: FileIdentity,
+    links: libc::nlink_t,
+    owner: libc::uid_t,
+    size: u64,
+}
+
 fn create_temporary(directory: &OwnedFd) -> Result<(CString, File, FileIdentity), IoError> {
     loop {
         let name = CString::new(format!(".rawzelia-tmp-{}", random_token()?))
@@ -604,8 +649,19 @@ fn create_temporary(directory: &OwnedFd) -> Result<(CString, File, FileIdentity)
         if descriptor >= 0 {
             // SAFETY: descriptor is checked above and transferred to one File.
             let file = unsafe { File::from_raw_fd(descriptor) };
-            let identity = descriptor_identity(file.as_raw_fd()).map_err(destination_error)?;
-            return Ok((name, file, identity));
+            // SAFETY: the descriptor refers to the exclusively-created staging file.
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+                return Err(destination_error(std::io::Error::last_os_error()));
+            }
+            let status = descriptor_status(file.as_raw_fd()).map_err(destination_error)?;
+            if status.links != 1
+                || status.identity.mode & libc::S_IFMT != libc::S_IFREG
+                || status.identity.mode & 0o777 != 0o600
+                || status.owner != unsafe { libc::geteuid() }
+            {
+                return Err(IoError::DestinationUnavailable);
+            }
+            return Ok((name, file, status.identity));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::AlreadyExists {
@@ -624,7 +680,7 @@ fn random_token() -> Result<Uuid, IoError> {
     Ok(Uuid::from_bytes(bytes))
 }
 
-fn descriptor_identity(descriptor: libc::c_int) -> std::io::Result<FileIdentity> {
+fn descriptor_status(descriptor: libc::c_int) -> std::io::Result<FileStatus> {
     let mut status = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: status points to writable storage and descriptor is borrowed for the call.
     let result = unsafe { libc::fstat(descriptor, status.as_mut_ptr()) };
@@ -633,63 +689,34 @@ fn descriptor_identity(descriptor: libc::c_int) -> std::io::Result<FileIdentity>
     }
     // SAFETY: a successful fstat initialized the complete stat structure.
     let status = unsafe { status.assume_init() };
-    Ok(FileIdentity {
-        device: status.st_dev,
-        inode: status.st_ino,
-        mode: status.st_mode,
+    Ok(FileStatus {
+        identity: FileIdentity {
+            device: status.st_dev,
+            inode: status.st_ino,
+            mode: status.st_mode,
+        },
+        links: status.st_nlink,
+        owner: status.st_uid,
+        size: status.st_size.try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "negative file size")
+        })?,
     })
-}
-
-fn path_identity(directory: &OwnedFd, name: &CString) -> Result<Option<FileIdentity>, IoError> {
-    let mut status = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: status is writable; descriptor and NUL-terminated name remain valid.
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            status.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(destination_error(error));
-    }
-    // SAFETY: a successful fstatat initialized the complete stat structure.
-    let status = unsafe { status.assume_init() };
-    Ok(Some(FileIdentity {
-        device: status.st_dev,
-        inode: status.st_ino,
-        mode: status.st_mode,
-    }))
-}
-
-fn cleanup_temporary(directory: &OwnedFd, name: &CString, owned: FileIdentity) {
-    if !matches!(path_identity(directory, name), Ok(Some(current)) if current == owned) {
-        return;
-    }
-    // SAFETY: identity was verified without following links immediately before this call.
-    unsafe {
-        libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
-    }
 }
 
 #[cfg(target_os = "macos")]
 fn rename_exclusive(
-    directory: &OwnedFd,
+    source_directory: &OwnedFd,
     source: &CString,
+    destination_directory: &OwnedFd,
     destination: &OsStr,
 ) -> std::io::Result<()> {
     let destination = c_string(destination)?;
-    // SAFETY: both names and the owned directory descriptor remain valid for the call.
+    // SAFETY: both names and both owned directory descriptors remain valid for the call.
     let result = unsafe {
         libc::renameatx_np(
-            directory.as_raw_fd(),
+            source_directory.as_raw_fd(),
             source.as_ptr(),
-            directory.as_raw_fd(),
+            destination_directory.as_raw_fd(),
             destination.as_ptr(),
             libc::RENAME_EXCL,
         )
@@ -703,17 +730,18 @@ fn rename_exclusive(
 
 #[cfg(not(target_os = "macos"))]
 fn rename_exclusive(
-    directory: &OwnedFd,
+    source_directory: &OwnedFd,
     source: &CString,
+    destination_directory: &OwnedFd,
     destination: &OsStr,
 ) -> std::io::Result<()> {
     let destination = c_string(destination)?;
     // SAFETY: both names and the owned directory descriptor remain valid for the call.
     let linked = unsafe {
         libc::linkat(
-            directory.as_raw_fd(),
+            source_directory.as_raw_fd(),
             source.as_ptr(),
-            directory.as_raw_fd(),
+            destination_directory.as_raw_fd(),
             destination.as_ptr(),
             0,
         )
@@ -721,8 +749,8 @@ fn rename_exclusive(
     if linked != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: source and the directory descriptor remain valid for the call.
-    let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), source.as_ptr(), 0) };
+    // SAFETY: source and the private staging descriptor remain valid for the call.
+    let removed = unsafe { libc::unlinkat(source_directory.as_raw_fd(), source.as_ptr(), 0) };
     if removed == 0 {
         Ok(())
     } else {

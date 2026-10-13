@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::fs::{self, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,6 +72,29 @@ fn volume_names_collide(root: &Path, first: &str, second: &str) -> bool {
     };
     fs::remove_dir_all(&probe).expect("probe directory should be removed");
     collision
+}
+
+fn find_staged_temporary(directory: &Path) -> PathBuf {
+    fn find(directory: &Path) -> Option<PathBuf> {
+        for entry in fs::read_dir(directory).ok()? {
+            let path = entry.ok()?.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if path.is_file() && name.starts_with(".rawzelia-tmp-") {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(temporary) = find(&path)
+            {
+                return Some(temporary);
+            }
+        }
+        None
+    }
+
+    find(directory).expect("owned staged temporary should exist")
 }
 
 #[test]
@@ -255,6 +279,142 @@ fn post_copy_cancellation_does_not_publish() {
 }
 
 #[test]
+fn substitution_after_validation_before_cleanup_preserves_third_party() {
+    let fixture = TestDirectory::new("cleanup-race");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let source = source_root.join("DSC_0001.NEF");
+    let source_bytes = b"verified source payload";
+    let third_party_bytes = b"third-party bytes must not be unlinked";
+    fs::write(&source, source_bytes).unwrap();
+    let plan = plan_ingest(&request(
+        &source_root,
+        vec![source.clone()],
+        &destination_root,
+    ))
+    .unwrap();
+    let calls = Cell::new(0_u8);
+    let staged_path = RefCell::new(None);
+    let third_party_link = fixture.path().join("third-party-owned.NEF");
+
+    let result = execute_ingest(&plan, &mut |_| {}, &|| {
+        let call = calls.get();
+        calls.set(call + 1);
+        if call != 3 {
+            return false;
+        }
+        let staged = find_staged_temporary(&plan.destination_root);
+        assert_eq!(
+            fs::metadata(staged.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::hard_link(&staged, &third_party_link).unwrap();
+        fs::remove_file(&staged).unwrap();
+        fs::hard_link(&third_party_link, &staged).unwrap();
+        fs::write(&third_party_link, third_party_bytes).unwrap();
+        staged_path.replace(Some(staged));
+        true
+    });
+
+    assert_eq!(result, Err(IoError::Cancelled));
+    let staged = staged_path.borrow();
+    let staged = staged.as_ref().expect("substitution should run");
+    assert_eq!(fs::read(staged).unwrap(), third_party_bytes);
+    assert_eq!(fs::read(&third_party_link).unwrap(), third_party_bytes);
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
+    assert!(!plan.items[0].destination.exists());
+}
+
+#[test]
+fn substitution_after_validation_before_rename_is_not_published() {
+    let fixture = TestDirectory::new("publish-substitution-race");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let source = source_root.join("DSC_0001.NEF");
+    let source_bytes = b"verified source payload";
+    let third_party_bytes = b"unverified replacement must not publish";
+    fs::write(&source, source_bytes).unwrap();
+    let plan = plan_ingest(&request(
+        &source_root,
+        vec![source.clone()],
+        &destination_root,
+    ))
+    .unwrap();
+    let calls = Cell::new(0_u8);
+    let replacement_path = RefCell::new(None);
+
+    let result = execute_ingest(&plan, &mut |_| {}, &|| {
+        let call = calls.get();
+        calls.set(call + 1);
+        if call != 3 {
+            return false;
+        }
+        let staged = find_staged_temporary(&plan.destination_root);
+        fs::remove_file(&staged).unwrap();
+        fs::write(&staged, third_party_bytes).unwrap();
+        replacement_path.replace(Some(staged));
+        false
+    });
+
+    assert_eq!(result, Err(IoError::DestinationUnavailable));
+    let replacement = replacement_path.borrow();
+    let replacement = replacement.as_ref().expect("substitution should run");
+    assert_eq!(fs::read(replacement).unwrap(), third_party_bytes);
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
+    assert!(!plan.items[0].destination.exists());
+}
+
+#[test]
+fn hardlinked_temporary_modified_before_publication_is_rejected() {
+    let fixture = TestDirectory::new("hardlink-race");
+    let source_root = fixture.path().join("source");
+    let destination_root = fixture.path().join("destination");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&destination_root).unwrap();
+    let source = source_root.join("DSC_0001.NEF");
+    let source_bytes = b"verified source payload";
+    let third_party_bytes = b"hardlink mutation must not publish";
+    fs::write(&source, source_bytes).unwrap();
+    let plan = plan_ingest(&request(
+        &source_root,
+        vec![source.clone()],
+        &destination_root,
+    ))
+    .unwrap();
+    let calls = Cell::new(0_u8);
+    let hardlink = fixture.path().join("concurrent-hardlink.NEF");
+
+    let result = execute_ingest(&plan, &mut |_| {}, &|| {
+        let call = calls.get();
+        calls.set(call + 1);
+        if call != 3 {
+            return false;
+        }
+        let staged = find_staged_temporary(&plan.destination_root);
+        fs::hard_link(staged, &hardlink).unwrap();
+        fs::write(&hardlink, third_party_bytes).unwrap();
+        false
+    });
+
+    assert_eq!(result, Err(IoError::DestinationUnavailable));
+    assert_eq!(fs::read(&hardlink).unwrap(), third_party_bytes);
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
+    assert!(!plan.items[0].destination.exists());
+}
+
+#[test]
 fn substituted_temporary_is_not_removed_during_cleanup() {
     let fixture = TestDirectory::new("temporary-substitution");
     let source_root = fixture.path().join("source");
@@ -280,16 +440,7 @@ fn substituted_temporary_is_not_removed_during_cleanup() {
         if call != 1 {
             return false;
         }
-        let parent = plan.items[0].destination.parent().unwrap();
-        let temporary = fs::read_dir(parent)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".rawzelia-tmp-"))
-            })
-            .expect("owned temporary should exist");
+        let temporary = find_staged_temporary(&plan.destination_root);
         fs::remove_file(&temporary).unwrap();
         fs::write(&temporary, third_party_bytes).unwrap();
         replacement_path.replace(Some(temporary));
