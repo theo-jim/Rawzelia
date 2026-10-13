@@ -1,6 +1,10 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -14,6 +18,25 @@ const BACKUP_VERSION: u16 = 1;
 const CATALOG_FILE: &str = "catalog.sqlite";
 const MANIFEST_FILE: &str = "manifest.json";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLISH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+fn install_before_publish_hook(hook: Box<dyn FnOnce()>) {
+    BEFORE_PUBLISH_HOOK.with(|slot| slot.replace(Some(hook)));
+}
+
+#[cfg(test)]
+fn run_before_publish_hook() {
+    BEFORE_PUBLISH_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupReport {
@@ -88,8 +111,13 @@ pub fn create_backup(
         let _ = fs::remove_dir_all(&temporary);
         return Err(BackupError::DestinationExists);
     }
-    if let Err(error) = fs::rename(&temporary, destination) {
+    #[cfg(test)]
+    run_before_publish_hook();
+    if let Err(error) = rename_directory_no_replace(&temporary, destination) {
         let _ = fs::remove_dir_all(&temporary);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(BackupError::DestinationExists);
+        }
         return Err(backup_io(error));
     }
     sync_directory(parent).map_err(backup_io)?;
@@ -119,8 +147,13 @@ pub fn restore_backup(backup: &Path, destination: &Path) -> Result<RestoreReport
         let _ = fs::remove_dir_all(&temporary);
         return Err(RestoreError::DestinationUntouched);
     }
-    if let Err(error) = fs::rename(&temporary, destination) {
+    #[cfg(test)]
+    run_before_publish_hook();
+    if let Err(error) = rename_directory_no_replace(&temporary, destination) {
         let _ = fs::remove_dir_all(&temporary);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(RestoreError::DestinationUntouched);
+        }
         return Err(restore_io(error));
     }
     sync_directory(parent).map_err(restore_io)?;
@@ -331,6 +364,33 @@ fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
     File::open(path)?.sync_all()
 }
 
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+    // SAFETY: both paths are live NUL-terminated strings for the duration of the call.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -355,4 +415,111 @@ fn backup_io(error: std::io::Error) -> BackupError {
 
 fn restore_io(error: std::io::Error) -> RestoreError {
     RestoreError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::*;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            loop {
+                let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "rawzelia-backup-{label}-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("test directory must be created: {error}"),
+                }
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn create_catalog(path: &Path) {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE assets (asset_id TEXT PRIMARY KEY);")
+            .unwrap();
+    }
+
+    fn install_concurrent_destination_creation(destination: PathBuf) -> thread::JoinHandle<u64> {
+        let (start_sender, start_receiver) = mpsc::sync_channel(0);
+        let (created_sender, created_receiver) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            start_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("publish hook must release destination creator");
+            fs::create_dir(&destination).expect("concurrent destination must be created");
+            let inode = fs::metadata(&destination).unwrap().ino();
+            created_sender
+                .send(inode)
+                .expect("created destination identity must be returned");
+            inode
+        });
+        install_before_publish_hook(Box::new(move || {
+            start_sender
+                .send(())
+                .expect("destination creator must start");
+            created_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("destination must exist before publication");
+        }));
+        worker
+    }
+
+    #[test]
+    fn concurrent_destination_creation_is_preserved_by_create_backup() {
+        let fixture = TestDirectory::new("create-race");
+        let catalog = fixture.path().join("catalog.sqlite");
+        let destination = fixture.path().join("backup");
+        create_catalog(&catalog);
+        let worker = install_concurrent_destination_creation(destination.clone());
+
+        let result = create_backup(&catalog, &[], &destination);
+        let concurrent_inode = worker.join().unwrap();
+
+        assert_eq!(result, Err(BackupError::DestinationExists));
+        assert!(destination.is_dir());
+        assert_eq!(fs::metadata(destination).unwrap().ino(), concurrent_inode);
+    }
+
+    #[test]
+    fn concurrent_destination_creation_is_preserved_by_restore_backup() {
+        let fixture = TestDirectory::new("restore-race");
+        let catalog = fixture.path().join("catalog.sqlite");
+        let backup = fixture.path().join("backup");
+        let destination = fixture.path().join("restored");
+        create_catalog(&catalog);
+        create_backup(&catalog, &[], &backup).unwrap();
+        let worker = install_concurrent_destination_creation(destination.clone());
+
+        let result = restore_backup(&backup, &destination);
+        let concurrent_inode = worker.join().unwrap();
+
+        assert_eq!(result, Err(RestoreError::DestinationUntouched));
+        assert!(destination.is_dir());
+        assert_eq!(fs::metadata(destination).unwrap().ino(), concurrent_inode);
+    }
 }
