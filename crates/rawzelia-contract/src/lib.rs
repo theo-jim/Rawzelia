@@ -1,9 +1,9 @@
 mod capabilities;
-mod commands;
+pub mod commands;
 mod events;
 mod keymap;
-mod lightroom_import;
-mod types;
+pub mod lightroom_import;
+pub mod types;
 
 pub use capabilities::{
     CONTRACT_VERSION, Capability, CapabilitySet, community_capabilities, pro_capabilities,

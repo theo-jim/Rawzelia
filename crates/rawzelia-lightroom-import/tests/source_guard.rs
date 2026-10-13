@@ -3,9 +3,12 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rawzelia_lightroom_import::{SourceGuardError, validate_source_guard};
+
+static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
 
@@ -15,12 +18,22 @@ impl TestDirectory {
             .duration_since(UNIX_EPOCH)
             .expect("system time must be after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "rawzelia-source-guard-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("temporary directory must be created");
-        Self(path)
+        Self::with_nonce(nonce)
+    }
+
+    fn with_nonce(nonce: u128) -> Self {
+        loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rawzelia-source-guard-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("temporary directory must be created: {error}"),
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -41,6 +54,18 @@ fn directory_entries(path: &Path) -> Vec<OsString> {
         .collect::<Vec<_>>();
     entries.sort();
     entries
+}
+
+#[test]
+fn temp_directories_are_unique_when_clock_values_collide() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after epoch")
+        .as_nanos();
+    let first = TestDirectory::with_nonce(nonce);
+    let second = TestDirectory::with_nonce(nonce);
+
+    assert_ne!(first.path(), second.path());
 }
 
 #[test]
